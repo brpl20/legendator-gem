@@ -1,7 +1,7 @@
 module Legendator
   class Pipeline
     Result = Struct.new(
-      :srt_content, :coverage, :token_usage, :chunks_info, :provider, :model,
+      :srt_content, :coverage, :token_usage, :chunks_info, :provider, :model, :cost,
       keyword_init: true
     )
 
@@ -54,6 +54,7 @@ module Legendator
       all_translations = {}
       total_input_tokens = 0
       total_output_tokens = 0
+      total_cost = 0.0
 
       chunks.each_with_index do |chunk, i|
         chunk_text = @file_breaker.format_chunk(chunk)
@@ -68,6 +69,12 @@ module Legendator
         all_translations.merge!(result[:translations])
         total_input_tokens += result[:response].input_tokens
         total_output_tokens += result[:response].output_tokens
+
+        if result[:response].cost
+          total_cost += result[:response].cost
+        else
+          log "     Warning: no cost data returned for chunk #{i + 1}"
+        end
 
         # Rate limit: small delay between chunks
         sleep(0.5) if i < chunks.size - 1
@@ -95,7 +102,8 @@ module Legendator
         },
         chunks_info: chunks_info,
         provider: @provider,
-        model: @model
+        model: @model,
+        cost: total_cost
       )
     end
 

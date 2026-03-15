@@ -15,7 +15,7 @@ module Legendator
       }
     }.freeze
 
-    Response = Struct.new(:content, :input_tokens, :output_tokens, :model, :raw, keyword_init: true)
+    Response = Struct.new(:content, :input_tokens, :output_tokens, :model, :raw, :cost, keyword_init: true)
 
     def initialize(provider: Config.provider, model: Config.model, api_key: nil)
       @provider = provider.to_sym
@@ -112,12 +112,14 @@ module Legendator
         input_tokens = usage["input_tokens"] || 0
         output_tokens = usage["output_tokens"] || 0
         model = parsed["model"] || @model
+        cost = nil
       else
         choice = parsed.dig("choices", 0, "message", "content") || ""
         usage = parsed["usage"] || {}
         input_tokens = usage["prompt_tokens"] || 0
         output_tokens = usage["completion_tokens"] || 0
         model = parsed["model"] || @model
+        cost = usage["total_cost"]&.to_f
       end
 
       Response.new(
@@ -125,7 +127,8 @@ module Legendator
         input_tokens: input_tokens,
         output_tokens: output_tokens,
         model: model,
-        raw: parsed
+        raw: parsed,
+        cost: cost
       )
     end
 
