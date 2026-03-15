@@ -1,0 +1,298 @@
+#!/usr/bin/env ruby
+
+begin
+  require "dotenv"
+  Dotenv.load
+rescue LoadError
+  # dotenv is optional — ENV vars can be set directly
+end
+
+require "legendator"
+
+# ─── CLI ─────────────────────────────────────────────
+#
+# Usage:
+#   legendator translate <file.srt> [options]
+#   legendator dry-run <file.srt> [options]
+#   legendator info <file.srt>
+#
+# Options:
+#   --provider=openai|openrouter
+#   --model=gpt-4.1-mini
+#   --lang=pt-BR
+#   --context="This is from Lord of the Rings"
+#   --max-tokens=3000
+#   --output=output.srt
+#
+# Examples:
+#   legendator translate test/fixtures/sample.srt --lang=pt-BR --context="Lord of the Rings opening narration"
+#   legendator translate test/fixtures/sample.srt --provider=openrouter --model=google/gemini-2.0-flash-001
+#   legendator dry-run test/fixtures/sample.srt
+#   legendator info test/fixtures/sample.srt
+# ──────────────────────────────────────────────────────
+
+def parse_options(args)
+  options = {
+    provider: Legendator::Config.provider,
+    model: Legendator::Config.model,
+    lang: Legendator::Config.target_language,
+    context: nil,
+    max_tokens: Legendator::Config.max_tokens_per_chunk,
+    output: nil
+  }
+
+  args.each do |arg|
+    case arg
+    when /\A--provider=(.+)\z/
+      options[:provider] = $1.to_sym
+    when /\A--model=(.+)\z/
+      options[:model] = $1
+    when /\A--lang=(.+)\z/
+      options[:lang] = $1
+    when /\A--context=(.+)\z/
+      options[:context] = $1
+    when /\A--max-tokens=(\d+)\z/
+      options[:max_tokens] = $1.to_i
+    when /\A--output=(.+)\z/
+      options[:output] = $1
+    end
+  end
+
+  options
+end
+
+def cmd_translate(file, options)
+  content = File.read(file)
+
+  pipeline = Legendator::Pipeline.new(
+    provider: options[:provider],
+    model: options[:model],
+    target_language: options[:lang],
+    context: options[:context],
+    max_tokens_per_chunk: options[:max_tokens],
+    logger: ->(msg) { puts msg }
+  )
+
+  result = pipeline.run(content)
+
+  # Write output
+  output_file = options[:output] || file.sub(/\.srt\z/i, "_#{options[:lang]}.srt")
+  File.write(output_file, result.srt_content)
+
+  puts ""
+  puts "=" * 50
+  puts "Output: #{output_file}"
+  puts "Coverage: #{result.coverage[:coverage_percent]}%"
+  puts "Tokens: #{result.token_usage[:input_tokens]} in / #{result.token_usage[:output_tokens]} out"
+  puts "Provider: #{result.provider} / #{result.model}"
+  puts "=" * 50
+end
+
+def cmd_dry_run(file, options)
+  content = File.read(file)
+
+  pipeline = Legendator::Pipeline.new(
+    provider: options[:provider],
+    model: options[:model],
+    target_language: options[:lang],
+    context: options[:context],
+    max_tokens_per_chunk: options[:max_tokens]
+  )
+
+  info = pipeline.dry_run(content)
+
+  puts "=" * 50
+  puts "DRY RUN - #{file}"
+  puts "=" * 50
+  puts "Subtitles: #{info[:subtitles]}"
+  puts "Chunks: #{info[:chunks][:total_chunks]}"
+  puts "Estimated tokens: ~#{info[:estimated_tokens][:total]}"
+  puts "Provider: #{info[:provider]} / #{info[:model]}"
+  puts "Target: #{info[:target_language]}"
+  puts ""
+  puts "Chunk details:"
+  puts "  Total entries: #{info[:chunks][:total_entries]}"
+  puts "  Total tokens:  #{info[:chunks][:total_tokens]}"
+  puts "  Max chunk:     #{info[:chunks][:max_chunk_tokens]} tokens"
+  puts "  Avg chunk:     #{info[:chunks][:avg_chunk_tokens]} tokens"
+  puts "=" * 50
+end
+
+def cmd_debug(file, options)
+  content = File.read(file)
+
+  parser = Legendator::SrtParser.new(content)
+  entries = parser.parse
+  texts = parser.extract_texts
+  timestamps = parser.extract_timestamps
+
+  counter = Legendator::TokenCounter.new
+  breaker = Legendator::FileBreaker.new(
+    token_counter: counter,
+    max_tokens_per_chunk: options[:max_tokens]
+  )
+  chunks = breaker.break_into_chunks(texts)
+
+  # Build the same prompts the AI client would use
+  lang_names = {
+    "pt-BR" => "Brazilian Portuguese", "pt-PT" => "European Portuguese",
+    "es" => "Spanish", "fr" => "French", "de" => "German",
+    "it" => "Italian", "ja" => "Japanese", "ko" => "Korean",
+    "zh" => "Simplified Chinese", "en" => "English"
+  }
+  lang = lang_names[options[:lang]] || options[:lang]
+
+  system_prompt = <<~PROMPT
+    You are a professional subtitle translator. Translate subtitles to #{lang}.
+
+    Rules:
+    - Maintain the exact same ID numbers
+    - Translate naturally, as spoken dialogue (not literal/robotic)
+    - Keep proper nouns (character names, place names) as they are commonly known in #{lang}
+    - Preserve line breaks within subtitles using <br> placeholder
+    - Return ONLY valid JSON in this exact format: {"translations": {"1": "translated text", "2": "translated text"}}
+    - Do NOT add any explanation, markdown, or extra text
+  PROMPT
+
+  if options[:context] && !options[:context].strip.empty?
+    system_prompt += "\nContext about this content: #{options[:context]}\n"
+    system_prompt += "Use this context to improve translation accuracy (character names, tone, setting).\n"
+  end
+
+  debug_data = {
+    file: file,
+    file_size_bytes: File.size(file),
+    encoding_info: {
+      raw_encoding: content.encoding.to_s,
+      valid_utf8: content.valid_encoding?
+    },
+    parser: {
+      total_entries: entries.size,
+      entries: entries.map { |e|
+        {
+          id: e.id,
+          timestamp: e.timestamp,
+          text: e.text,
+          text_length: e.text.length,
+          token_count: counter.count(e.text)
+        }
+      }
+    },
+    texts_hash: texts,
+    timestamps_hash: timestamps,
+    chunking: {
+      max_tokens_per_chunk: options[:max_tokens],
+      token_method: counter.method_used,
+      total_chunks: chunks.size,
+      summary: breaker.summary(chunks),
+      chunks: chunks.each_with_index.map { |chunk, i|
+        chunk_text = breaker.format_chunk(chunk)
+        user_prompt = "Translate these subtitles. Each line is formatted as ID|text:\n\n#{chunk_text}"
+        {
+          chunk_index: i,
+          entry_count: chunk.entries.size,
+          token_count: chunk.token_count,
+          entry_ids: chunk.entries.keys.sort,
+          formatted_text: chunk_text,
+          ai_request: {
+            system_prompt: system_prompt,
+            user_prompt: user_prompt
+          }
+        }
+      }
+    },
+    options: {
+      provider: options[:provider],
+      model: options[:model],
+      target_language: options[:lang],
+      context: options[:context],
+      max_tokens: options[:max_tokens]
+    }
+  }
+
+  output_file = options[:output] || file.sub(/\.srt\z/i, "_debug.json")
+  File.write(output_file, JSON.pretty_generate(debug_data))
+
+  puts "=" * 50
+  puts "DEBUG EXPORT - #{file}"
+  puts "=" * 50
+  puts "Entries parsed: #{entries.size}"
+  puts "Chunks: #{chunks.size}"
+  puts "Token method: #{counter.method_used}"
+  puts "Output: #{output_file}"
+  puts "=" * 50
+end
+
+def cmd_info(file, _options)
+  content = File.read(file)
+  parser = Legendator::SrtParser.new(content)
+  entries = parser.parse
+  counter = Legendator::TokenCounter.new
+
+  puts "=" * 50
+  puts "FILE INFO - #{file}"
+  puts "=" * 50
+  puts "Subtitles: #{entries.size}"
+  puts "File size: #{File.size(file)} bytes"
+  puts "Token method: #{counter.method_used}"
+
+  total_tokens = entries.sum { |e| counter.count(e.text) }
+  puts "Total tokens (text only): ~#{total_tokens}"
+
+  puts ""
+  puts "First 5 entries:"
+  entries.first(5).each do |entry|
+    tokens = counter.count(entry.text)
+    puts "  ##{entry.id} [#{tokens} tok] #{entry.text[0..60]}"
+  end
+
+  if entries.size > 5
+    puts "  ... and #{entries.size - 5} more"
+  end
+  puts "=" * 50
+end
+
+# ─── Main ────────────────────────────────────────────
+
+command = ARGV[0]
+file = ARGV[1]
+options = parse_options(ARGV[2..] || [])
+
+case command
+when "translate"
+  abort "Usage: legendator translate <file.srt> [options]" unless file
+  abort "File not found: #{file}" unless File.exist?(file)
+  cmd_translate(file, options)
+
+when "dry-run"
+  abort "Usage: legendator dry-run <file.srt> [options]" unless file
+  abort "File not found: #{file}" unless File.exist?(file)
+  cmd_dry_run(file, options)
+
+when "info"
+  abort "Usage: legendator info <file.srt> [options]" unless file
+  abort "File not found: #{file}" unless File.exist?(file)
+  cmd_info(file, options)
+
+when "debug"
+  abort "Usage: legendator debug <file.srt> [options]" unless file
+  abort "File not found: #{file}" unless File.exist?(file)
+  cmd_debug(file, options)
+
+else
+  puts "Legendator v#{Legendator::VERSION} - Subtitle Translator"
+  puts ""
+  puts "Commands:"
+  puts "  legendator translate <file.srt> [options]  - Translate an SRT file"
+  puts "  legendator dry-run <file.srt> [options]    - Estimate without calling AI"
+  puts "  legendator info <file.srt>                 - Show file information"
+  puts "  legendator debug <file.srt> [options]      - Export debug JSON with all intermediate data"
+  puts ""
+  puts "Options:"
+  puts "  --provider=openai|openrouter"
+  puts "  --model=gpt-4.1-mini"
+  puts "  --lang=pt-BR"
+  puts "  --context=\"This is from Lord of the Rings\""
+  puts "  --max-tokens=3000"
+  puts "  --output=output.srt"
+end

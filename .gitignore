@@ -1,0 +1,21 @@
+.env
+.DS_Store
+
+# Gem build artifacts
+*.gem
+pkg/
+
+# Working SRT files (keep test fixtures)
+*.srt
+!test/fixtures/*.srt
+
+# Debug/output files
+*_debug.json
+
+# Bundler
+Gemfile.lock
+
+# IDE
+.ruby-lsp/
+.idea/
+.vscode/
