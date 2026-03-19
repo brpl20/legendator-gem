@@ -1,7 +1,7 @@
 module Legendator
   class Pipeline
     Result = Struct.new(
-      :srt_content, :coverage, :token_usage, :chunks_info, :provider, :model, :cost,
+      :srt_content, :coverage, :token_usage, :chunks_info, :provider, :model, :cost, :consistency,
       keyword_init: true
     )
 
@@ -31,7 +31,7 @@ module Legendator
 
     # Run the full pipeline on an SRT file
     def run(srt_content)
-      log "[1/5] Parsing SRT file..."
+      log "[1/6] Parsing SRT file..."
       parser = SrtParser.new(srt_content)
       texts = parser.extract_texts
       timestamps = parser.extract_timestamps
@@ -43,12 +43,12 @@ module Legendator
       log "     Found #{texts.size} subtitles"
       log "     Token counting method: #{@token_counter.method_used}"
 
-      log "[2/5] Breaking into chunks..."
+      log "[2/6] Breaking into chunks..."
       chunks = @file_breaker.break_into_chunks(texts)
       chunks_info = @file_breaker.summary(chunks)
       log "     #{chunks_info[:total_chunks]} chunks, ~#{chunks_info[:total_tokens]} tokens total"
 
-      log "[3/5] Translating with #{@provider}/#{@model}..."
+      log "[3/6] Translating with #{@provider}/#{@model}..."
       client = AiClient.new(provider: @provider, model: @model, api_key: @api_key)
 
       all_translations = {}
@@ -80,7 +80,7 @@ module Legendator
         sleep(0.5) if i < chunks.size - 1
       end
 
-      log "[4/5] Reconstructing SRT..."
+      log "[4/6] Reconstructing SRT..."
       reconstructor = SrtReconstructor.new(all_translations, timestamps, texts)
       srt_output = reconstructor.build
       coverage = reconstructor.coverage_report
@@ -90,7 +90,24 @@ module Legendator
         log "     Missing IDs: #{coverage[:missing_ids].join(', ')}"
       end
 
-      log "[5/5] Done!"
+      log "[5/6] Checking consistency..."
+      consistency_checker = ConsistencyChecker.new(
+        original_srt: srt_content,
+        translated_srt: srt_output,
+        target_language: @target_language,
+        provider: @provider,
+        model: @model,
+        api_key: @api_key
+      )
+      consistency = consistency_checker.run
+
+      if consistency.pass?
+        log "     Consistency check passed"
+      else
+        log "     Consistency check FAILED: #{consistency.errors.join('; ')}"
+      end
+
+      log "[6/6] Done!"
 
       Result.new(
         srt_content: srt_output,
@@ -103,7 +120,8 @@ module Legendator
         chunks_info: chunks_info,
         provider: @provider,
         model: @model,
-        cost: total_cost
+        cost: total_cost,
+        consistency: consistency
       )
     end
 
