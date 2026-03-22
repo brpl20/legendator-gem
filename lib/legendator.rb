@@ -7,6 +7,7 @@ require_relative "legendator/file_breaker"
 require_relative "legendator/ai_client"
 require_relative "legendator/srt_reconstructor"
 require_relative "legendator/pipeline"
+require_relative "legendator/consistency_checker"
 
 module Legendator
   # Errors

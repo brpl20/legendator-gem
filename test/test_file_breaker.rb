@@ -124,7 +124,7 @@ class TestFileBreaker < Minitest::Test
   # ─── Integration with SRT Parser ───────────────────
 
   def test_chunks_from_real_srt
-    content = fixture("sample.srt")
+    content = fixture("serie-example.srt")
     parser = Legendator::SrtParser.new(content)
     texts = parser.extract_texts
 
