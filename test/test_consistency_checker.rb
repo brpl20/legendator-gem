@@ -2,8 +2,8 @@ require_relative "test_helper"
 
 class TestConsistencyChecker < Minitest::Test
   def setup
-    @original_srt = fixture("sample.srt")
-    @translated_srt = fixture("sample_pt-BR.srt")
+    @original_srt = fixture("serie-example.srt")
+    @translated_srt = fixture("serie-example-pt-BR.srt")
   end
 
   # ─── Structural: Count ───────────────────────────
@@ -19,7 +19,8 @@ class TestConsistencyChecker < Minitest::Test
   end
 
   def test_structural_fail_when_subtitle_missing
-    bad_translated = @translated_srt.sub(/14\n00:01:03.*?Um anel para governar todos eles\.\n*/m, "")
+    # Remove subtitle 100 from translation
+    bad_translated = @translated_srt.sub(/\n100\n[^\n]+\n[^\n]+\n/m, "\n")
     checker = Legendator::ConsistencyChecker.new(
       original_srt: @original_srt,
       translated_srt: bad_translated,
@@ -49,7 +50,7 @@ class TestConsistencyChecker < Minitest::Test
   # ─── Structural: Timestamps ─────────────────────
 
   def test_structural_fail_when_timestamp_differs
-    bad_translated = @translated_srt.sub("00:00:01,000 --> 00:00:04,000", "00:00:01,000 --> 00:00:99,000")
+    bad_translated = @translated_srt.sub("00:00:02,810 --> 00:00:06,002", "00:00:02,810 --> 00:00:99,000")
     checker = Legendator::ConsistencyChecker.new(
       original_srt: @original_srt,
       translated_srt: bad_translated,
@@ -78,8 +79,8 @@ end
 
 class TestConsistencyCheckerTranslation < Minitest::Test
   def setup
-    @original_srt = fixture("sample.srt")
-    @translated_srt = fixture("sample_pt-BR.srt")
+    @original_srt = fixture("serie-example.srt")
+    @translated_srt = fixture("serie-example-pt-BR.srt")
   end
 
   def test_pick_sample_ids_returns_requested_count

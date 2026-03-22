@@ -137,7 +137,7 @@ class TestStructuredReturn < Minitest::Test
 
   def test_full_roundtrip_mock
     # 1. Parse the real SRT
-    content = fixture("sample.srt")
+    content = fixture("serie-example.srt")
     parser = Legendator::SrtParser.new(content)
     texts = parser.extract_texts
     timestamps = parser.extract_timestamps
@@ -169,7 +169,7 @@ class TestStructuredReturn < Minitest::Test
   # ─── Pipeline Dry Run ──────────────────────────────
 
   def test_pipeline_dry_run
-    content = fixture("sample.srt")
+    content = fixture("serie-example.srt")
     pipeline = Legendator::Pipeline.new(
       provider: :openai,
       model: "gpt-4o-mini",
