@@ -2,7 +2,8 @@ module Legendator
   class Configuration
     attr_accessor :provider, :model, :target_language,
                   :max_tokens_per_chunk, :prompt_overhead, :temperature,
-                  :api_key, :openai_api_key, :openrouter_api_key
+                  :api_key, :openai_api_key, :openrouter_api_key,
+                  :fallback_providers, :max_retries, :retry_base_delay
 
     def initialize
       @provider             = ENV.fetch("DEFAULT_PROVIDER", "openai").to_sym
@@ -14,6 +15,9 @@ module Legendator
       @api_key              = nil
       @openai_api_key       = nil
       @openrouter_api_key   = nil
+      @fallback_providers   = []       # e.g. [{ provider: :openai, model: "gpt-4.1-mini" }]
+      @max_retries          = 3        # retries per provider before moving to fallback
+      @retry_base_delay     = 2        # base delay in seconds for exponential backoff
     end
 
     # Resolve the API key for a given provider.

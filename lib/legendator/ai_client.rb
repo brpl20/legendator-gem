@@ -15,13 +15,36 @@ module Legendator
       }
     }.freeze
 
+    # HTTP status codes that are safe to retry
+    RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504].freeze
+
+    # Errors that indicate transient network issues
+    RETRYABLE_ERRORS = [
+      Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNRESET,
+      Errno::ECONNREFUSED, Errno::ETIMEDOUT, OpenSSL::SSL::SSLError,
+      SocketError, EOFError
+    ].freeze
+
     Response = Struct.new(:content, :input_tokens, :output_tokens, :model, :raw, :cost, keyword_init: true)
+
+    # Custom error raised on retryable failures so Pipeline can attempt fallback
+    class RetryableError < Legendator::TranslationError
+      attr_reader :status_code, :provider
+
+      def initialize(message, status_code: nil, provider: nil)
+        @status_code = status_code
+        @provider = provider
+        super(message)
+      end
+    end
 
     def initialize(provider: Config.provider, model: Config.model, api_key: nil)
       @provider = provider.to_sym
       @model = model
       @api_key = api_key || Legendator.configuration.api_key_for(@provider)
       @base_url = PROVIDERS.dig(@provider, :base_url)
+      @max_retries = Legendator.configuration.max_retries
+      @retry_base_delay = Legendator.configuration.retry_base_delay
 
       raise "Unknown provider: #{@provider}" unless PROVIDERS.key?(@provider)
       raise "API key not set for #{@provider}. Set #{PROVIDERS.dig(@provider, :env_key)}" if @api_key.nil? || @api_key.empty?
@@ -43,8 +66,59 @@ module Legendator
       { translations: translations, response: response }
     end
 
-    # Raw chat completion
+    # Raw chat completion with automatic retry and exponential backoff
     def chat(system_prompt:, user_prompt:, temperature: Config.temperature)
+      attempt = 0
+
+      loop do
+        attempt += 1
+        begin
+          return execute_chat_request(
+            system_prompt: system_prompt,
+            user_prompt: user_prompt,
+            temperature: temperature
+          )
+        rescue *RETRYABLE_ERRORS => e
+          if attempt <= @max_retries
+            delay = backoff_delay(attempt)
+            sleep(delay)
+            next
+          end
+          raise RetryableError.new(
+            "#{@provider} network error after #{@max_retries} retries: #{e.message}",
+            provider: @provider
+          )
+        rescue RetryableError
+          raise
+        rescue => e
+          if e.message =~ /API Error \((\d+)\)/
+            status = $1.to_i
+            if RETRYABLE_STATUS_CODES.include?(status) && attempt <= @max_retries
+              delay = backoff_delay(attempt)
+              sleep(delay)
+              next
+            elsif RETRYABLE_STATUS_CODES.include?(status)
+              raise RetryableError.new(
+                "#{@provider} API error after #{@max_retries} retries: #{e.message}",
+                status_code: status, provider: @provider
+              )
+            end
+          end
+          raise
+        end
+      end
+    end
+
+    private
+
+    def backoff_delay(attempt)
+      # Exponential backoff with jitter: base * 2^(attempt-1) + random jitter
+      base = @retry_base_delay * (2**(attempt - 1))
+      jitter = rand * base * 0.5
+      base + jitter
+    end
+
+    def execute_chat_request(system_prompt:, user_prompt:, temperature:)
       uri = URI(@base_url)
 
       body = if @provider == :openai
@@ -131,8 +205,6 @@ module Legendator
         cost: cost
       )
     end
-
-    private
 
     def build_system_prompt(target_language, context)
       lang_names = {
