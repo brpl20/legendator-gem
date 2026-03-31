@@ -12,7 +12,8 @@ module Legendator
       context: nil,
       max_tokens_per_chunk: Config.max_tokens_per_chunk,
       api_key: nil,
-      logger: nil
+      logger: nil,
+      fallback_providers: nil
     )
       @provider = provider.to_sym
       @model = model
@@ -21,6 +22,7 @@ module Legendator
       @max_tokens = max_tokens_per_chunk
       @api_key = api_key
       @logger = logger
+      @fallback_providers = fallback_providers || Legendator.configuration.fallback_providers || []
 
       @token_counter = TokenCounter.new(model: @model)
       @file_breaker = FileBreaker.new(
@@ -50,23 +52,31 @@ module Legendator
       chunks_info = @file_breaker.summary(chunks)
       log "     #{chunks_info[:total_chunks]} chunks, ~#{chunks_info[:total_tokens]} tokens total"
 
-      log "[3/7] Translating with #{@provider}/#{@model}..."
-      client = AiClient.new(provider: @provider, model: @model, api_key: @api_key)
+      # Build provider chain: primary first, then fallbacks (excluding duplicates of the primary)
+      primary = { provider: @provider, model: @model, api_key: @api_key }
+      filtered_fallbacks = @fallback_providers.reject do |fb|
+        fb[:provider].to_sym == @provider && fb[:model] == @model
+      end
+      provider_chain = [primary] + filtered_fallbacks
+      active_provider = nil
+      active_model = nil
+      client = nil
 
       all_translations = {}
       total_input_tokens = 0
       total_output_tokens = 0
       total_cost = 0.0
 
+      log "[3/7] Translating with #{@provider}/#{@model}..."
+
       chunks.each_with_index do |chunk, i|
         chunk_text = @file_breaker.format_chunk(chunk)
         log "     Chunk #{i + 1}/#{chunks.size} (#{chunk.entries.size} subtitles, ~#{chunk.token_count} tokens)..."
 
-        result = client.translate(
-          chunk_text,
-          target_language: @target_language,
-          context: @context
-        )
+        result = translate_chunk_with_fallback(chunk_text, provider_chain)
+        active_provider = result[:active_provider]
+        active_model = result[:active_model]
+        client = result[:client]
 
         all_translations.merge!(result[:translations])
         total_input_tokens += result[:response].input_tokens
@@ -81,6 +91,9 @@ module Legendator
         # Rate limit: small delay between chunks
         sleep(0.5) if i < chunks.size - 1
       end
+
+      # Use the last successful client for repairs
+      client ||= AiClient.new(provider: @provider, model: @model, api_key: @api_key)
 
       log "[4/7] Repairing missing subtitles..."
       repair_result = repair_missing(client, texts, all_translations)
@@ -133,8 +146,8 @@ module Legendator
           total_tokens: total_input_tokens + total_output_tokens
         },
         chunks_info: chunks_info,
-        provider: @provider,
-        model: @model,
+        provider: active_provider || @provider,
+        model: active_model || @model,
         cost: total_cost,
         consistency: consistency
       )
@@ -164,6 +177,80 @@ module Legendator
     end
 
     private
+
+    # Try translating a chunk with the primary provider, falling back to alternatives on failure.
+    # Each provider in the chain gets full retry attempts (configured in AiClient) before
+    # moving to the next. Raises if ALL providers in the chain fail.
+    def translate_chunk_with_fallback(chunk_text, provider_chain)
+      errors_by_provider = []
+
+      provider_chain.each_with_index do |provider_config, idx|
+        prov = provider_config[:provider].to_sym
+        mod = provider_config[:model] || @model
+        key = provider_config[:api_key]
+
+        begin
+          client = AiClient.new(provider: prov, model: mod, api_key: key)
+          result = client.translate(
+            chunk_text,
+            target_language: @target_language,
+            context: @context
+          )
+
+          if idx > 0
+            log "     Fallback successful: using #{prov}/#{mod}"
+          end
+
+          return {
+            translations: result[:translations],
+            response: result[:response],
+            client: client,
+            active_provider: prov,
+            active_model: mod
+          }
+        rescue AiClient::RetriesExhaustedError => e
+          # All retries exhausted for this provider — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
+        rescue Legendator::ConfigurationError => e
+          # Bad config (unknown provider, missing key) — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
+        rescue Legendator::Error => e
+          # Known translation/parse errors — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
+        end
+        # Note: unexpected errors (NoMethodError, etc.) propagate immediately
+      end
+
+      # All providers exhausted — use sanitized error summaries
+      error_details = errors_by_provider.map { |e| "#{e[:provider]}/#{e[:model]}: #{e[:error]}" }.join("; ")
+      raise Legendator::TranslationError,
+        "All providers failed. Tried #{provider_chain.size} provider(s): #{error_details}"
+    end
+
+    def log_fallback(prov, mod, error, provider_chain, idx)
+      return unless idx < provider_chain.size - 1
+      next_prov = provider_chain[idx + 1]
+      log "     FALLBACK: #{prov}/#{mod} failed (#{sanitize_error(error)}). Trying #{next_prov[:provider]}/#{next_prov[:model] || @model}..."
+    end
+
+    # Strip potentially sensitive details (API response bodies, keys) from error messages
+    def sanitize_error(error)
+      case error
+      when AiClient::ApiError
+        "HTTP #{error.status_code}"
+      when AiClient::RetriesExhaustedError
+        msg = error.message
+        msg = "HTTP #{error.status_code} (retries exhausted)" if error.status_code
+        msg
+      else
+        # Truncate to avoid leaking full API responses
+        msg = error.message.to_s
+        msg.length > 120 ? "#{msg[0, 120]}..." : msg
+      end
+    end
 
     # Re-translate subtitles that the AI dropped from chunk responses.
     # Tries up to MAX_REPAIR_ATTEMPTS times, sending only the missing IDs.

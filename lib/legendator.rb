@@ -1,3 +1,11 @@
+module Legendator
+  # Errors (defined before requires so subclasses in other files can inherit)
+  class Error < StandardError; end
+  class ConfigurationError < Error; end
+  class TranslationError < Error; end
+  class ParseError < Error; end
+end
+
 require_relative "legendator/version"
 require_relative "legendator/configuration"
 require_relative "legendator/config"
@@ -10,11 +18,6 @@ require_relative "legendator/pipeline"
 require_relative "legendator/consistency_checker"
 
 module Legendator
-  # Errors
-  class Error < StandardError; end
-  class ConfigurationError < Error; end
-  class TranslationError < Error; end
-  class ParseError < Error; end
 
   class << self
     # Returns the global configuration singleton.
@@ -80,7 +83,8 @@ module Legendator
         target_language:      lang                   || cfg.target_language,
         context:              context,
         max_tokens_per_chunk: overrides[:max_tokens_per_chunk] || cfg.max_tokens_per_chunk,
-        api_key:              overrides[:api_key]
+        api_key:              overrides[:api_key],
+        fallback_providers:   overrides[:fallback_providers] || cfg.fallback_providers
       )
     end
   end
