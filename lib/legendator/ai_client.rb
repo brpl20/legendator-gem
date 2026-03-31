@@ -18,17 +18,31 @@ module Legendator
     # HTTP status codes that are safe to retry
     RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504].freeze
 
-    # Errors that indicate transient network issues
-    RETRYABLE_ERRORS = [
+    # Maximum backoff delay in seconds to prevent unbounded sleep
+    MAX_BACKOFF_DELAY = 30
+
+    # Errors that indicate transient network issues (retry-safe)
+    RETRYABLE_NETWORK_ERRORS = [
       Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNRESET,
-      Errno::ECONNREFUSED, Errno::ETIMEDOUT, OpenSSL::SSL::SSLError,
+      Errno::ECONNREFUSED, Errno::ETIMEDOUT,
       SocketError, EOFError
     ].freeze
 
     Response = Struct.new(:content, :input_tokens, :output_tokens, :model, :raw, :cost, keyword_init: true)
 
-    # Custom error raised on retryable failures so Pipeline can attempt fallback
-    class RetryableError < Legendator::TranslationError
+    # Structured error for HTTP API failures (carries status code directly)
+    class ApiError < Legendator::TranslationError
+      attr_reader :status_code, :response_body
+
+      def initialize(status_code, response_body)
+        @status_code = status_code
+        @response_body = response_body
+        super("API Error (#{status_code})")
+      end
+    end
+
+    # Raised after all retries for a provider are exhausted (signals Pipeline to try fallback)
+    class RetriesExhaustedError < Legendator::TranslationError
       attr_reader :status_code, :provider
 
       def initialize(message, status_code: nil, provider: nil)
@@ -46,8 +60,8 @@ module Legendator
       @max_retries = Legendator.configuration.max_retries
       @retry_base_delay = Legendator.configuration.retry_base_delay
 
-      raise "Unknown provider: #{@provider}" unless PROVIDERS.key?(@provider)
-      raise "API key not set for #{@provider}. Set #{PROVIDERS.dig(@provider, :env_key)}" if @api_key.nil? || @api_key.empty?
+      raise Legendator::ConfigurationError, "Unknown provider: #{@provider}" unless PROVIDERS.key?(@provider)
+      raise Legendator::ConfigurationError, "API key not set for #{@provider}. Set #{PROVIDERS.dig(@provider, :env_key)}" if @api_key.nil? || @api_key.empty?
     end
 
     # Send a translation request for a chunk of subtitles
@@ -66,56 +80,62 @@ module Legendator
       { translations: translations, response: response }
     end
 
-    # Raw chat completion with automatic retry and exponential backoff
+    # Raw chat completion with automatic retry and exponential backoff.
+    # Makes up to max_retries + 1 total attempts (1 initial + max_retries retries).
     def chat(system_prompt:, user_prompt:, temperature: Config.temperature)
-      attempt = 0
+      last_error = nil
 
-      loop do
-        attempt += 1
+      (1..@max_retries + 1).each do |attempt|
         begin
           return execute_chat_request(
             system_prompt: system_prompt,
             user_prompt: user_prompt,
             temperature: temperature
           )
-        rescue *RETRYABLE_ERRORS => e
+        rescue *RETRYABLE_NETWORK_ERRORS => e
+          raise e if ssl_certificate_error?(e)
+          last_error = e
           if attempt <= @max_retries
-            delay = backoff_delay(attempt)
-            sleep(delay)
-            next
+            sleep(backoff_delay(attempt))
+          else
+            raise RetriesExhaustedError.new(
+              "#{@provider} network error after #{@max_retries} retries: #{e.class}",
+              provider: @provider
+            )
           end
-          raise RetryableError.new(
-            "#{@provider} network error after #{@max_retries} retries: #{e.message}",
-            provider: @provider
-          )
-        rescue RetryableError
-          raise
-        rescue => e
-          if e.message =~ /API Error \((\d+)\)/
-            status = $1.to_i
-            if RETRYABLE_STATUS_CODES.include?(status) && attempt <= @max_retries
-              delay = backoff_delay(attempt)
-              sleep(delay)
-              next
-            elsif RETRYABLE_STATUS_CODES.include?(status)
-              raise RetryableError.new(
-                "#{@provider} API error after #{@max_retries} retries: #{e.message}",
-                status_code: status, provider: @provider
-              )
-            end
+        rescue ApiError => e
+          last_error = e
+          if RETRYABLE_STATUS_CODES.include?(e.status_code) && attempt <= @max_retries
+            sleep(backoff_delay(attempt))
+          elsif RETRYABLE_STATUS_CODES.include?(e.status_code)
+            raise RetriesExhaustedError.new(
+              "#{@provider} API error after #{@max_retries} retries (HTTP #{e.status_code})",
+              status_code: e.status_code, provider: @provider
+            )
+          else
+            raise
           end
-          raise
         end
       end
+
+      # Should not reach here, but just in case
+      raise last_error if last_error
     end
 
     private
 
     def backoff_delay(attempt)
-      # Exponential backoff with jitter: base * 2^(attempt-1) + random jitter
-      base = @retry_base_delay * (2**(attempt - 1))
+      # Exponential backoff with jitter, capped at MAX_BACKOFF_DELAY
+      base = [@retry_base_delay * (2**(attempt - 1)), MAX_BACKOFF_DELAY].min
       jitter = rand * base * 0.5
       base + jitter
+    end
+
+    # Distinguish TLS certificate failures (security-critical, should not retry)
+    # from transient SSL errors (handshake timeouts, etc.)
+    def ssl_certificate_error?(error)
+      return false unless error.is_a?(OpenSSL::SSL::SSLError)
+      error.message =~ /certificate|verify|cert/i
     end
 
     def execute_chat_request(system_prompt:, user_prompt:, temperature:)
@@ -154,29 +174,24 @@ module Legendator
         headers["X-Title"] = "Legendator"
       end
 
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = true
-      http.read_timeout = 900
-      http.open_timeout = 60
-
       # Configure SSL cert store without CRL checking (macOS/rbenv compatibility)
       cert_store = OpenSSL::X509::Store.new
       cert_store.set_default_paths
-      http.cert_store = cert_store
-      http.verify_mode = OpenSSL::SSL::VERIFY_PEER
 
       request = Net::HTTP::Post.new(uri.path, headers)
       request.body = body.to_json
 
-      raw_response = http.request(request)
+      raw_response = Net::HTTP.start(
+        uri.host, uri.port,
+        use_ssl: true,
+        read_timeout: 180,
+        open_timeout: 60,
+        cert_store: cert_store,
+        verify_mode: OpenSSL::SSL::VERIFY_PEER
+      ) { |http| http.request(request) }
 
       unless raw_response.is_a?(Net::HTTPSuccess)
-        error_body = begin
-          JSON.parse(raw_response.body)
-        rescue
-          raw_response.body
-        end
-        raise "API Error (#{raw_response.code}): #{error_body}"
+        raise ApiError.new(raw_response.code.to_i, raw_response.body)
       end
 
       parsed = JSON.parse(raw_response.body)

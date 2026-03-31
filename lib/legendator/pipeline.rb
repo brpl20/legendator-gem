@@ -208,26 +208,48 @@ module Legendator
             active_provider: prov,
             active_model: mod
           }
-        rescue AiClient::RetryableError => e
-          errors_by_provider << { provider: prov, model: mod, error: e.message }
-          if idx < provider_chain.size - 1
-            next_prov = provider_chain[idx + 1]
-            log "     FALLBACK: #{prov}/#{mod} failed (#{e.message}). Trying #{next_prov[:provider]}/#{next_prov[:model] || @model}..."
-          end
-        rescue => e
-          # Non-retryable errors (auth, bad request) — skip to next provider
-          errors_by_provider << { provider: prov, model: mod, error: e.message }
-          if idx < provider_chain.size - 1
-            next_prov = provider_chain[idx + 1]
-            log "     FALLBACK: #{prov}/#{mod} error (#{e.message}). Trying #{next_prov[:provider]}/#{next_prov[:model] || @model}..."
-          end
+        rescue AiClient::RetriesExhaustedError => e
+          # All retries exhausted for this provider — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
+        rescue Legendator::ConfigurationError => e
+          # Bad config (unknown provider, missing key) — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
+        rescue Legendator::Error => e
+          # Known translation/parse errors — cascade to next
+          errors_by_provider << { provider: prov, model: mod, error: sanitize_error(e) }
+          log_fallback(prov, mod, e, provider_chain, idx)
         end
+        # Note: unexpected errors (NoMethodError, etc.) propagate immediately
       end
 
-      # All providers exhausted
+      # All providers exhausted — use sanitized error summaries
       error_details = errors_by_provider.map { |e| "#{e[:provider]}/#{e[:model]}: #{e[:error]}" }.join("; ")
       raise Legendator::TranslationError,
         "All providers failed. Tried #{provider_chain.size} provider(s): #{error_details}"
+    end
+
+    def log_fallback(prov, mod, error, provider_chain, idx)
+      return unless idx < provider_chain.size - 1
+      next_prov = provider_chain[idx + 1]
+      log "     FALLBACK: #{prov}/#{mod} failed (#{sanitize_error(error)}). Trying #{next_prov[:provider]}/#{next_prov[:model] || @model}..."
+    end
+
+    # Strip potentially sensitive details (API response bodies, keys) from error messages
+    def sanitize_error(error)
+      case error
+      when AiClient::ApiError
+        "HTTP #{error.status_code}"
+      when AiClient::RetriesExhaustedError
+        msg = error.message
+        msg = "HTTP #{error.status_code} (retries exhausted)" if error.status_code
+        msg
+      else
+        # Truncate to avoid leaking full API responses
+        msg = error.message.to_s
+        msg.length > 120 ? "#{msg[0, 120]}..." : msg
+      end
     end
 
     # Re-translate subtitles that the AI dropped from chunk responses.
